@@ -1,0 +1,428 @@
+{
+  "name": "Bank Financing Process",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-application",
+        "responseMode": "lastNode",
+        "response": {
+          "responseData": "firstEntryJson"
+        }
+      },
+      "id": "webhook-trigger",
+      "name": "Loan Application Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "webhookId": "loan-application-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate loan application data\nconst requiredFields = ['firstName', 'lastName', 'email', 'income', 'loanAmount'];\nconst missingFields = requiredFields.filter(field => !$json[field]);\n\nif (missingFields.length > 0) {\n  throw new Error(`Missing required fields: ${missingFields.join(', ')}`);\n}\n\n// Validate loan amount\nif ($json.loanAmount < 1000 || $json.loanAmount > 1000000) {\n  throw new Error('Loan amount must be between $1,000 and $1,000,000');\n}\n\n// Generate application ID\nconst applicationId = `LOAN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;\n\n// Calculate debt-to-income ratio (if debt provided)\nconst debtToIncomeRatio = $json.monthlyDebt ? ($json.monthlyDebt / ($json.income / 12)) : 0;\n\nreturn {\n  ....$json,\n  applicationId,\n  debtToIncomeRatio,\n  status: 'pending',\n  submittedAt: new Date().toISOString()\n};"
+      },
+      "id": "validate-application",
+      "name": "Validate Application",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "loan_applications",
+        "columns": "application_id, first_name, last_name, email, phone, income, loan_amount, loan_purpose, employment_status, status",
+        "values": "{{$json.applicationId}}, {{$json.firstName}}, {{$json.lastName}}, {{$json.email}}, {{$json.phone}}, {{$json.income}}, {{$json.loanAmount}}, {{$json.loanPurpose}}, {{$json.employmentStatus}}, {{$json.status}}"
+      },
+      "id": "save-application",
+      "name": "Save to Database",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [600, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.creditreport.com/v1/credit-score",
+        "authentication": "headerAuth",
+        "headerAuth": {
+          "name": "Authorization",
+          "value": "Bearer {{$credentials.creditBureauToken}}"
+        },
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "{\n  \"ssn\": \"{{$json.ssn}}\",\n  \"firstName\": \"{{$json.firstName}}\",\n  \"lastName\": \"{{$json.lastName}}\",\n  \"address\": \"{{$json.address}}\"\n}"
+      },
+      "id": "credit-check",
+      "name": "Credit Bureau Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "prompt": "Analyze the following loan application for risk assessment:\n\nPersonal Information:\n- Name: {{$json.firstName}} {{$json.lastName}}\n- Income: ${{$json.income}}\n- Employment: {{$json.employmentStatus}}\n- Credit Score: {{$json.creditScore || 'Not available'}}\n- Loan Amount: ${{$json.loanAmount}}\n- Loan Purpose: {{$json.loanPurpose}}\n- Debt-to-Income Ratio: {{$json.debtToIncomeRatio}}\n\nProvide a risk assessment with:\n1. Risk score (1-10, where 10 is lowest risk)\n2. Risk factors identified\n3. Recommendations\n4. Suggested interest rate range\n\nRespond in JSON format with: {\"riskScore\": number, \"riskFactors\": [string], \"recommendations\": string, \"suggestedRate\": {\"min\": number, \"max\": number}}",
+        "outputFormat": "json"
+      },
+      "id": "ai-risk-assessment",
+      "name": "AI Risk Assessment",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1,
+      "position": [1000, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge credit score and risk assessment data\nconst creditData = $('Credit Bureau Check').first();\nconst riskData = $('AI Risk Assessment').first();\nconst applicationData = $('Save to Database').first();\n\n// Parse AI assessment if it's a string\nlet aiAssessment;\ntry {\n  aiAssessment = typeof riskData.json === 'string' ? JSON.parse(riskData.json) : riskData.json;\n} catch (e) {\n  aiAssessment = { riskScore: 5, riskFactors: ['Assessment parsing error'], recommendations: 'Manual review required' };\n}\n\n// Determine approval route based on risk score and amount\nconst riskScore = aiAssessment.riskScore || 5;\nconst loanAmount = applicationData.json.loanAmount;\nconst creditScore = creditData.json?.creditScore || 650;\n\nlet approvalRoute;\nif (riskScore >= 8 && loanAmount <= 50000 && creditScore >= 700) {\n  approvalRoute = 'auto-approve';\n} else if (riskScore >= 6 && loanAmount <= 100000 && creditScore >= 650) {\n  approvalRoute = 'manager-approval';\n} else if (riskScore >= 4 && creditScore >= 600) {\n  approvalRoute = 'senior-approval';\n} else {\n  approvalRoute = 'auto-reject';\n}\n\nreturn {\n  ...applicationData.json,\n  creditScore,\n  riskScore,\n  riskFactors: aiAssessment.riskFactors,\n  recommendations: aiAssessment.recommendations,\n  suggestedRate: aiAssessment.suggestedRate,\n  approvalRoute,\n  processedAt: new Date().toISOString()\n};"
+      },
+      "id": "merge-assessment",
+      "name": "Merge Assessment Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "auto-approve",
+              "leftValue": "={{$json.approvalRoute}}",
+              "rightValue": "auto-approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "manager-approval",
+              "leftValue": "={{$json.approvalRoute}}",
+              "rightValue": "manager-approval",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "senior-approval",
+              "leftValue": "={{$json.approvalRoute}}",
+              "rightValue": "senior-approval",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "auto-reject",
+              "leftValue": "={{$json.approvalRoute}}",
+              "rightValue": "auto-reject",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "approval-router",
+      "name": "Approval Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1400, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#loan-approvals",
+        "text": "🏦 New loan application requires approval",
+        "attachments": [
+          {
+            "color": "#FFA500",
+            "title": "Loan Application #{{$json.applicationId}}",
+            "fields": [
+              {
+                "title": "Applicant",
+                "value": "{{$json.firstName}} {{$json.lastName}}",
+                "short": true
+              },
+              {
+                "title": "Amount",
+                "value": "${{$json.loanAmount}}",
+                "short": true
+              },
+              {
+                "title": "Risk Score",
+                "value": "{{$json.riskScore}}/10",
+                "short": true
+              },
+              {
+                "title": "Credit Score",
+                "value": "{{$json.creditScore}}",
+                "short": true
+              },
+              {
+                "title": "Purpose",
+                "value": "{{$json.loanPurpose}}",
+                "short": true
+              },
+              {
+                "title": "Income",
+                "value": "${{$json.income}}",
+                "short": true
+              }
+            ]
+          }
+        ]
+      },
+      "id": "slack-notification",
+      "name": "Slack Approval Request",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1600, 200],
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "slack-credentials",
+          "name": "Slack OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": "loan_applications",
+        "updateKey": "application_id",
+        "columns": "status, risk_score, credit_score, updated_at",
+        "values": "approved, {{$json.riskScore}}, {{$json.creditScore}}, NOW()"
+      },
+      "id": "auto-approve-db",
+      "name": "Auto Approve - Update DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1600, 100],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "to": "{{$json.email}}",
+        "subject": "Loan Application Approved - {{$json.applicationId}}",
+        "message": "Dear {{$json.firstName}},\n\nCongratulations! Your loan application has been approved.\n\nLoan Details:\n- Application ID: {{$json.applicationId}}\n- Loan Amount: ${{$json.loanAmount}}\n- Estimated Interest Rate: {{$json.suggestedRate.min}}% - {{$json.suggestedRate.max}}%\n\nNext Steps:\n1. Review the attached loan terms\n2. Complete any required documentation\n3. Schedule a meeting with our loan officer\n\nWe will contact you within 1-2 business days to finalize the details.\n\nBest regards,\nLoan Processing Team"
+      },
+      "id": "approval-email",
+      "name": "Send Approval Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1800, 100],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-credentials",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": "loan_applications",
+        "updateKey": "application_id",
+        "columns": "status, risk_score, credit_score, updated_at",
+        "values": "rejected, {{$json.riskScore}}, {{$json.creditScore}}, NOW()"
+      },
+      "id": "auto-reject-db",
+      "name": "Auto Reject - Update DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1600, 400],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-credentials",
+          "name": "PostgreSQL Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "to": "{{$json.email}}",
+        "subject": "Loan Application Status - {{$json.applicationId}}",
+        "message": "Dear {{$json.firstName}},\n\nThank you for your loan application. After careful review, we are unable to approve your request at this time.\n\nThis decision was based on:\n{{$json.riskFactors.join('\\n- ')}}\n\nRecommendations:\n{{$json.recommendations}}\n\nYou may reapply in 6 months or contact us to discuss alternative options.\n\nSincerely,\nLoan Processing Team"
+      },
+      "id": "rejection-email",
+      "name": "Send Rejection Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1800, 400],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "gmail-credentials",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "webhook",
+        "webhookId": "approval-response"
+      },
+      "id": "approval-webhook",
+      "name": "Approval Response Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [1600, 300]
+    }
+  ],
+  "connections": {
+    "Loan Application Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Application",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Application": {
+      "main": [
+        [
+          {
+            "node": "Save to Database",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Database": {
+      "main": [
+        [
+          {
+            "node": "Credit Bureau Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Credit Bureau Check": {
+      "main": [
+        [
+          {
+            "node": "AI Risk Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Risk Assessment": {
+      "main": [
+        [
+          {
+            "node": "Merge Assessment Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Assessment Data": {
+      "main": [
+        [
+          {
+            "node": "Approval Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Router": {
+      "main": [
+        [
+          {
+            "node": "Auto Approve - Update DB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Auto Reject - Update DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto Approve - Update DB": {
+      "main": [
+        [
+          {
+            "node": "Send Approval Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto Reject - Update DB": {
+      "main": [
+        [
+          {
+            "node": "Send Rejection Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
